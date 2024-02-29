@@ -1,21 +1,32 @@
 import os
 import numpy
-
+import torch
+from torchvision import transforms
 class CongestionDataset():
-    def __init__(self, root_dir, transform=None):
-        self.cong_labels = os.path.join(root_dir, 'labels/label/')
-        self.cong_dir = os.path.join(root_dir, 'features/feature/')
-        self.transform = transform
-
+    def __init__(self,
+                 root_dir,
+                 input_transform = transforms.ToTensor(),
+                 output_transform =transforms.ToTensor()
+                ):
+        self.img_labels_dir = os.path.join(
+            root_dir,
+            'label/'
+        )
+        self.img_dir = os.path.join(
+            root_dir,
+            'feature/'
+        )
+        self.input_transform = input_transform
+        self.output_transform = output_transform
     def __len__(self):
-        return len([name for name in os.listdir(self.cong_labels)])
-
-
+        return len([name for name in os.listdir(self.img_labels_dir)])
     def __getitem__(self, idx):
-        with open(os.path.join(self.cong_dir, sorted(os.listdir(self.cong_dir))[idx]), 'rb') as f:
+        with open(os.path.join(self.img_dir, sorted(os.listdir(self.img_dir))[idx]), 'rb') as f:
             image = numpy.load(f)
-        with open(os.path.join(self.cong_labels, sorted(os.listdir(self.cong_labels))[idx]), 'rb') as f2:
-            label = numpy.load(f2)
-        if self.transform:
-            self.transform(image)
-        return (image, label)
+        with open(os.path.join(self.img_labels_dir, sorted(os.listdir(self.img_labels_dir))[idx]), 'rb') as f:
+            label = numpy.load(f)
+        if self.input_transform:
+            image = self.input_transform(image)
+        if self.output_transform:
+            label = self.output_transform(label)
+        return image.to(torch.float16), label.to(torch.float16)
