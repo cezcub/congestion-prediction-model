@@ -1,39 +1,66 @@
 import torch
+import random
 from congestion_model import CongestionModel
+from vit import ViTForClassification
+from unet import UNet
 from dataset import CongestionDataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from pytorch_msssim import SSIM
 import argparse
-from torchvision import transforms
+import torchvision.transforms.v2 as transforms
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def train(rootpath,batch_size,num_epochs,lr,fig_savepath,weight_savepath, weight_decay=0.001):
+def train(rootpath,batch_size,num_epochs,lr,modelname,fig_savepath,weight_savepath,weight_decay=0.001):
 
 
     #data
     dataset = CongestionDataset(
-        root_dir = "../data/base_maps",
+        root_dir = "../data/",
+        num_buckets = 0,
         input_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Resize((256, 256))
+            transforms.ToImage(),
+            transforms.ToDtype(torch.float32, scale=True),
+            transforms.Resize((256, 256)),
+            transforms.RandomHorizontalFlip(0.5),
+            transforms.RandomVerticalFlip(0.5),
+            transforms.RandomRotation(90)
         ]),
         output_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Resize((256, 256))
+            transforms.ToImage(),
+            transforms.ToDtype(torch.float32, scale=True),
+            transforms.Resize((256, 256)),
+            transforms.RandomHorizontalFlip(0.5),
+            transforms.RandomVerticalFlip(0.5),
+            transforms.RandomRotation(90)
         ])
     )
-    
     len_train_set = int(len(dataset)*0.7)
-    len_test_set = len(dataset)-len_train_set
-    train_set, test_set = torch.utils.data.random_split(dataset, [len_train_set,len_test_set])
+    len_test_set = int(len(dataset)-len_train_set)
+    train_set, test_set = torch.utils.data.random_split(dataset, [len_train_set, len_test_set])
     train_loader = DataLoader(dataset=train_set, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(dataset=test_set, batch_size=batch_size, shuffle=True)
 
-    #model
-    model = CongestionModel(device).to(device)
+    if modelname == 'FPN':
+        model = CongestionModel(device).to(device)
+    elif modelname == 'ViT':
+        model = ViTForClassification(config={
+            "patch_size": 32,
+            "hidden_size": 48,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 32,
+            "intermediate_size": 4 * 48,
+            "hidden_dropout_prob": 0.0,
+            "attention_probs_dropout_prob": 0.0,
+            "initializer_range": 0.02,
+            "image_size": 256,
+            "num_classes": 65536,
+            "num_channels": 3,
+            "qkv_bias": True}).to(device)
+    elif modelname == 'UNet':
+        model = UNet().to(device)
 
     #criterion
     ssim = SSIM(data_range=1, size_average=True, channel=1)
@@ -62,9 +89,11 @@ def train(rootpath,batch_size,num_epochs,lr,fig_savepath,weight_savepath, weight
             # forward
             with torch.cuda.amp.autocast():
                 pred = model(features)
-                pred2 = model.sigmoid(pred)
+                pred2 = torch.sigmoid(pred)
                 train_loss = criterion(pred,labels)
                 train_ssim = (1-ssim(pred2,labels.type(torch.float16)))
+            if train_ssim < 0.1:
+                compare_img(pred2,labels,model,ssim,dataset.get_idx())
             # backward
             optimizer.zero_grad()
             scaler.scale(train_loss).backward()
@@ -77,7 +106,6 @@ def train(rootpath,batch_size,num_epochs,lr,fig_savepath,weight_savepath, weight
         train_losses.append(t/n1)
         train_ssims.append(s/n1)
 
-
         #eval
         model.eval()
         v = 0
@@ -88,9 +116,11 @@ def train(rootpath,batch_size,num_epochs,lr,fig_savepath,weight_savepath, weight
             labels = labels.to(device=device)
             with torch.cuda.amp.autocast():
                 pred = model(features)
-                pred2 = model.sigmoid(pred)
+                pred2 = torch.sigmoid(pred)
                 test_ssim = (1-ssim(pred2,labels.type(torch.float16)))
                 test_loss = criterion(pred, labels)
+            if dataset.get_idx() == '10370':
+                compare_img(pred2,labels,model,ssim,dataset.get_idx())
             v += test_loss.item()
             s2 += test_ssim.item()
             n2 += 1
@@ -100,10 +130,11 @@ def train(rootpath,batch_size,num_epochs,lr,fig_savepath,weight_savepath, weight
 
         print("\n")
         print(f'Epoch {e}: Train Loss: {t/n1}  | Test Loss: {v/n2}')
-        if v/n2 < best_test_Loss:
-            print(f'Best Epoch {e}: Test Loss: {v/n2}')
+        print(f'Epoch {e}: Train SSIM: {s/n1} | Test SSIM: {s2/n2}')
+        if s2/n2 < best_test_Loss:
+            print(f'Best Epoch {e}: Test SSIM: {s2/n2}')
             torch.save(model.state_dict(), f'{weight_savepath}/congestion_weights.pt')
-            best_test_Loss = v/n2
+            best_test_Loss = s2/n2
         if t/n1 < best_train_Loss:
             print(f'Best Epoch {e}: Train Loss: {t/n1}')
             torch.save(model.state_dict(), f'{weight_savepath}/congestion_train_weights.pt')
@@ -120,7 +151,7 @@ def train(rootpath,batch_size,num_epochs,lr,fig_savepath,weight_savepath, weight
     plt.legend(("Val"), loc='best',fontsize=16)
     plt.title("Loss")
     plt.grid(linestyle=':')
-    plt.savefig(f"{num_epochs}|{lr}|{weight_decay}|Fulllosses.png")
+    plt.savefig(f"{num_epochs}|{lr}|{weight_decay}|{modelname}loss.png")
     plt.clf()
 
     fig = plt.figure()
@@ -132,17 +163,17 @@ def train(rootpath,batch_size,num_epochs,lr,fig_savepath,weight_savepath, weight
     plt.ylim([0, 1])
     plt.title("SSIM")
     plt.grid(linestyle=':')
-    plt.savefig(f"{num_epochs}|{lr}|{weight_decay}|FullSSIMS.png")
+    plt.savefig(f"{num_epochs}|{lr}|{weight_decay}|{modelname}SSIM.png")
     plt.clf()
 
-
+def compare_img(pred, labels, model, scorer, idx):
     fig, ax = plt.subplots(1, 2, figsize=(9, 4.5), tight_layout=True)
-    pred = model.sigmoid(pred)
+    score = 1-scorer(pred.type(torch.float16),labels.type(torch.float16))
     ax[0].imshow(pred[0,0].detach().cpu())
     ax[1].imshow(labels[0,0].cpu())
-    ax[0].title.set_text('Pred')
+    ax[0].title.set_text(f'Pred     SSIM: {score.item()}')
     ax[1].title.set_text('Label')
-    plt.savefig(f"{fig_savepath}/compare.png")
+    plt.savefig(f"goodSSIM.png")
     plt.clf()
 
 def parse_args():
@@ -160,16 +191,9 @@ if __name__ == "__main__":
     import time
     start = time.time()
     args = parse_args()
-    train(rootpath=args.root_path,batch_size=args.batch_size,num_epochs=args.num_epochs,lr=args.learning_rate,
-          fig_savepath=args.fig_path,weight_savepath=args.weight_path)
-    end = time.time()
-    print("training cost time：%f sec" % (end - start))
-
-
-
-
-
-
-
-
-
+    params = {'FPN': 0.001, 'ViT': 0.001, 'UNet': 0.0003}
+    for k, v in params.items():
+        train(rootpath=args.root_path,batch_size=args.batch_size,num_epochs=args.num_epochs,lr=v,modelname=k,
+                fig_savepath=args.fig_path,weight_savepath=args.weight_path)
+        end = time.time()
+        print("training cost time：%f sec" % (end - start))
